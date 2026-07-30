@@ -1,0 +1,26 @@
+server:
+  port: 8090
+
+spring:
+  application:
+    name: nexus-mcp-sidecar
+  ai:
+    mcp:
+      server:
+        name: blss-master-mcp
+        version: 0.1.0
+        # Spring AI 2.0.0 WebMvc: Streamable HTTP is the default transport.
+        #   POST/GET/DELETE  /mcp   (single streamable endpoint)
+        protocol: streamable
+        type: sync
+        streamable-http:
+          mcp-endpoint: /mcp
+
+sidecar:
+  master-base-url: ${MASTER_BASE_URL:http://blss6163o.devsh.opi.zone/rest/}
+  api-key: ${SIDECAR_API_KEY:change-me-dev-key}
+  api-key-header: X-API-Key
+  # Inbound header (Leg B) carrying the end-user delegation token from the MCP client.
+  user-token-header: X-BLSS-User-Token
+  # Outbound header the sidecar sets when calling master REST.
+  master-auth-header: Authorization
