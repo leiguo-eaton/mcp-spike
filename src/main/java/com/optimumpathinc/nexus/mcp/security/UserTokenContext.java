@@ -11,6 +11,12 @@ package com.optimumpathinc.nexus.mcp.security;
  */
 public final class UserTokenContext {
 
+    /**
+     * JWT claim carrying the BLSS delegation token (Leg B). The Authorization Server writes it into
+     * the issued access token; {@link UserTokenCaptureFilter} reads it back for {@code MasterClient}.
+     */
+    public static final String BLSS_TOKEN_CLAIM = "blss_token";
+
     private static final ThreadLocal<String> TOKEN = new ThreadLocal<>();
 
     private UserTokenContext() {

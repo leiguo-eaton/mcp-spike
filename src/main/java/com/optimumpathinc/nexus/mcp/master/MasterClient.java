@@ -6,6 +6,7 @@ import java.util.Map;
 import java.util.stream.Collectors;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
+import org.springframework.http.client.SimpleClientHttpRequestFactory;
 import org.springframework.stereotype.Component;
 import org.springframework.web.client.RestClient;
 import org.springframework.web.util.UriComponentsBuilder;
@@ -27,8 +28,14 @@ public class MasterClient {
 
     public MasterClient(SidecarProperties props) {
         this.props = props;
+        // Bound outbound calls to master so a slow/hung backend fails fast instead of stalling the
+        // MCP tool call (which otherwise races with the client tearing down the SSE session).
+        SimpleClientHttpRequestFactory factory = new SimpleClientHttpRequestFactory();
+        factory.setConnectTimeout(props.getMasterConnectTimeout());
+        factory.setReadTimeout(props.getMasterReadTimeout());
         this.restClient = RestClient.builder()
                 .baseUrl(props.getMasterBaseUrl())
+                .requestFactory(factory)
                 .build();
     }
 

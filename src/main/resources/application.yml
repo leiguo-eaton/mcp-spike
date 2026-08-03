@@ -4,6 +4,24 @@ server:
 spring:
   application:
     name: nexus-mcp-sidecar
+  # File-backed H2 database persisting the Authorization Server state (registered clients,
+  # authorizations, consents) across restarts. AUTO_SERVER lets a concurrently-running H2 console
+  # attach if needed. The DB files live under ./data/.
+  datasource:
+    url: jdbc:h2:file:./data/as-db;AUTO_SERVER=TRUE;DB_CLOSE_DELAY=-1
+    driver-class-name: org.h2.Driver
+    username: sa
+    password: ""
+  sql:
+    init:
+      mode: always
+      # Bundled Spring Authorization Server schemas (H2-compatible). continue-on-error swallows the
+      # "table already exists" errors on subsequent boots (schema is created once, then reused).
+      continue-on-error: true
+      schema-locations:
+        - classpath:org/springframework/security/oauth2/server/authorization/client/oauth2-registered-client-schema.sql
+        - classpath:org/springframework/security/oauth2/server/authorization/oauth2-authorization-schema.sql
+        - classpath:org/springframework/security/oauth2/server/authorization/oauth2-authorization-consent-schema.sql
   ai:
     mcp:
       server:
@@ -20,7 +38,34 @@ sidecar:
   master-base-url: ${MASTER_BASE_URL:http://blss6163o.devsh.opi.zone/rest/}
   api-key: ${SIDECAR_API_KEY:change-me-dev-key}
   api-key-header: X-API-Key
+  # Bound outbound master REST calls so a slow/hung backend fails fast instead of stalling the MCP
+  # tool call (which otherwise races with the client tearing down the SSE session).
+  master-connect-timeout: ${SIDECAR_MASTER_CONNECT_TIMEOUT:5s}
+  master-read-timeout: ${SIDECAR_MASTER_READ_TIMEOUT:15s}
   # Inbound header (Leg B) carrying the end-user delegation token from the MCP client.
   user-token-header: X-BLSS-User-Token
   # Outbound header the sidecar sets when calling master REST.
   master-auth-header: Authorization
+  # Leg A (OAuth 2.1): public base URL of this sidecar. Used as the OAuth issuer and to build
+  # the protected-resource metadata. MUST match the URL the MCP client uses (e.g. mcp.json url host).
+  issuer-uri: ${SIDECAR_ISSUER_URI:http://localhost:8090}
+  # Demo resource-owner credentials for the interactive OAuth login page (POC only).
+  auth-username: ${SIDECAR_AUTH_USER:mcp}
+  auth-password: ${SIDECAR_AUTH_PASS:mcp-pass}
+  # Leg B (on-behalf-of) — fixed BLSS delegation token (Base64 of user:password) embedded into the
+  # issued access-token JWT as the blss_token claim, then forwarded to master REST as Basic auth.
+  # POC only; later replace with a per-user value derived at login. Empty = no token forwarded.
+  blss-user-token: ${SIDECAR_BLSS_USER_TOKEN:Z2w6TUJqdEZJSWJCN2xvVnIwYUZHR2tGQzdqcXZhVXU5NXJuSnZnOWJEcVBYYklkQzgxaVJlVA==}
+  # Recover client_ids that VS Code cached from an earlier (lost) in-memory registration. VS Code
+  # does not re-register on failure, so pre-seed its cached public client here to stop the auth loop.
+
+# Diagnostic logging: written to ./sidecar.log (project root when launched from IntelliJ) so the
+# server-side view of VS Code's OAuth + MCP requests is readable regardless of how the app is
+# started. Remove once the auth-popup loop is confirmed fixed.
+logging:
+  file:
+    name: sidecar.log
+  level:
+    org.springframework.security.web: DEBUG
+    org.springframework.security.oauth2: DEBUG
+    io.modelcontextprotocol: DEBUG

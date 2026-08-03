@@ -42,7 +42,7 @@
             <artifactId>spring-ai-starter-mcp-server-webmvc</artifactId>
         </dependency>
 
-        <!-- Web + Security for Leg A (Nexus -> sidecar API-Key auth) -->
+        <!-- Web + Security -->
         <dependency>
             <groupId>org.springframework.boot</groupId>
             <artifactId>spring-boot-starter-web</artifactId>
@@ -52,10 +52,45 @@
             <artifactId>spring-boot-starter-security</artifactId>
         </dependency>
 
+        <!-- Leg A (OAuth 2.1): sidecar is BOTH the Authorization Server and the Resource Server.
+             VS Code / Nexus MCP client authenticates via OAuth 2.1 (authorization code + PKCE,
+             dynamic client registration) instead of a static API key. -->
+        <dependency>
+            <groupId>org.springframework.security</groupId>
+            <artifactId>spring-security-oauth2-authorization-server</artifactId>
+        </dependency>
+        <dependency>
+            <groupId>org.springframework.boot</groupId>
+            <artifactId>spring-boot-starter-oauth2-resource-server</artifactId>
+        </dependency>
+
         <!-- Config validation -->
         <dependency>
             <groupId>org.springframework.boot</groupId>
             <artifactId>spring-boot-starter-validation</artifactId>
+        </dependency>
+
+        <!-- Persistence for the Authorization Server: dynamically-registered clients, issued
+             authorizations and consents are stored in a file-backed H2 database so they survive
+             sidecar restarts. Without this, in-memory DCR clients are wiped on every restart and
+             MCP clients (VS Code) loop forever re-authenticating against a client_id the server
+             no longer recognises. -->
+        <dependency>
+            <groupId>org.springframework.boot</groupId>
+            <artifactId>spring-boot-starter-jdbc</artifactId>
+        </dependency>
+        <dependency>
+            <groupId>com.h2database</groupId>
+            <artifactId>h2</artifactId>
+            <scope>runtime</scope>
+        </dependency>
+
+        <!-- Spring Framework 7 removed spring-jcl; spring-core now pulls commons-logging, which
+             Spring Boot excludes. Provide the commons-logging API via the slf4j bridge so it
+             routes through logback (fixes NoClassDefFoundError o.a.commons.logging.LogFactory). -->
+        <dependency>
+            <groupId>org.slf4j</groupId>
+            <artifactId>jcl-over-slf4j</artifactId>
         </dependency>
 
         <dependency>
