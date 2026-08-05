@@ -80,7 +80,10 @@ public class DeviceSearchTools {
         }
         String term = value.trim();
         if (!term.isEmpty()) {
-            clauses.add(field + ":(*" + term + "*)");
+            // Escape whitespace so multi-word terms stay a single token, e.g.
+            //   "Air Conditioner" -> type_name:(*Air\ Conditioner*)
+            String escaped = term.replaceAll("\\s+", "\\\\ ");
+            clauses.add(field + ":(*" + escaped + "*)");
         }
     }
 }
