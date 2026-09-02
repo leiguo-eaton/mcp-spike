@@ -1,324 +1,368 @@
-# 路線 2：真·OAuth2 OBO（RFC 8693 Token Exchange）設計
+# OAuth 2.0 OBO Token Exchange and MCP Gateway Design
 
-> 把現在「所有人共用一個寫死的 `blss_token`」改成「**登入的人 = master 看到的人**」，並用標準的
-> **RFC 8693 Token Exchange** 表達「sidecar 代表某使用者去呼叫 master」這層委派關係。
+> Current target design for BLSS. Source of truth:
+> `openspec/changes/gateway-obo-token-exchange/`.
 
----
+## 0. Implementation status
 
-## 1. 目標與範圍
+| Part | Status |
+|------|--------|
+| MCP Gateway (`mcp-spike`) — token validation, discovery metadata, lazy aggregation, prefix routing | **Implemented** |
+| Master AS — signing key, JWKS, RFC 8414 metadata | **Implemented** (`mcp-obo-token-issuance` §1) |
+| Master AS — `USER_TOKEN` minting | Not started (§2 of that change) |
+| Master AS — token endpoint (exchange + refresh) | Not started (§3) |
+| BLSS MCP — `/mcp` endpoint, per-request authentication, `sub` → user id | **Implemented** (`mcp-blss-server` §1–2) |
+| BLSS MCP — actual business tools | Not started (§3); only a `whoami` diagnostic tool exists |
+| Superset MCP | Deferred until its authentication contract is confirmed |
 
-現況（Phase 0）是「披著 OBO 外衣的共享服務憑證」：`sidecar.blss-user-token` 是寫死的固定值
-（解碼為 `gl:密碼`），任何人登入都被塞同一個 `blss_token`，master 永遠看到同一個使用者 `gl`。
+**Nothing is end-to-end yet**: no component can issue an `MCP_ACCESS_TOKEN` outside of tests, because
+the token endpoint does not exist. That is the single blocking item.
 
-本設計要讓委派變真的，並分兩階段落地：
+Two implementation choices worth recording here because they are not obvious from the design:
 
-```
-Phase 0 (現狀)        Phase 1 (本設計主體)              Phase 2 (終態)
-共享固定 blss_token  →  真身份登入 + Token Exchange   →  master 變 OAuth2 RS
-                        + Master憑證橋接(補 Basic)       直接轉發 token2, 拔掉橋接
-```
+- The master token endpoint is **hand-written**, not `spring-security-oauth2-authorization-server`.
+  That library's token-exchange provider requires an authenticated registered client and requires the
+  `subject_token` to be an access token it issued and stored itself — both contradict this design
+  (`token_endpoint_auth_methods_supported=["none"]`, and a `USER_TOKEN` minted on a dedicated path).
+- The Gateway's RFC 9728 metadata is served by **Spring Security's own filter**, not by an
+  application controller. Spring Security 7 handles `/.well-known/oauth-protected-resource/**`
+  itself and shadows any controller mapped there.
 
-**已知問題：master 只有 Basic 認證。** 這個問題由 Phase 1 的
-「Master 憑證解析器（Credential Resolver）」橋接件承接，等 Phase 2 master 能認 JWT 時拔掉。
+## 1. Goals
 
----
+- Preserve the identity of the user already authenticated by master.
+- Let the browser call the Agent with a session-bound `USER_TOKEN`, which the Agent exchanges without an interactive OAuth redirect flow.
+- Keep `mcp-spike` as a pure MCP Gateway / OAuth Resource Server, not an Authorization Server.
+- Aggregate BLSS MCP and Superset MCP tools behind one `/mcp` endpoint.
+- Forward the same validated user token to the selected backend, where RBAC is enforced again.
 
-## 2. 角色定義
+## 2. Roles
 
-| 角色 | 職責 | 現在有嗎 |
-|------|------|---------|
-| **MCP 客戶端 (VS Code)** | 公開 PKCE 客戶端，拿 token1 呼叫 `/mcp` | ✅ 不變 |
-| **使用者 (瀏覽器)** | resource owner，輸入**企業帳密** | ✅ 但目前是 demo `mcp` |
-| **身份源 IdP / LDAP / AD** | 真實使用者身份的權威來源 | ❌ 要接 |
-| **Sidecar 授權伺服器 (AS)** | 簽 token1；**新增 token-exchange grant** 簽 token2 | 🔶 要擴充 |
-| **Sidecar 資源伺服器 (RS `/mcp`)** | 驗 token1 | ✅ 不變 |
-| **Sidecar OBO 元件** | 拿 token1 去 AS 換 token2，再呼叫 master | ❌ 要新建 |
-| **Master 憑證解析器 (Resolver)** | 把 token2 的 `sub` 映射成 master 的 per-user Basic 憑證（補 Basic 的橋） | ❌ 要新建 |
-| **BLSS master REST** | 下游，目前只認 Basic | 🔶 Phase 1 幾乎不動 / Phase 2 變 RS |
+| Component | Responsibility |
+|-----------|----------------|
+| Chatbot UI (browser) | Mints a `USER_TOKEN` before each chat request and calls the Agent directly with it |
+| Core / master | Exposes the mint endpoint; derives `sub` from the authenticated session |
+| Agent Service | Performs RFC 8693 exchange and refresh, caches the MCP tokens per user/resource, and acts as the MCP client |
+| Master Authorization Server | Publishes RFC 8414 metadata and JWKS; issues `MCP_ACCESS_TOKEN` and `MCP_REFRESH_TOKEN` |
+| MCP Gateway (`mcp-spike`) | Validates the access token, lazily aggregates backend tools, routes calls, and passes the token through |
+| BLSS MCP | Exposes BLSS tools and independently validates the token before applying BLSS RBAC |
+| Superset MCP | Exposes Superset tools and independently validates the token before applying Superset authorization |
 
----
+The Gateway does not expose `/login`, authorization-code/PKCE, dynamic client registration,
+consent, or its own token endpoint.
 
-## 3. Token 設計（兩張 token 的關係）
+**No component in this chain has a service account.** The Agent can only reach `/mcp` inside a user
+request, and the Gateway can only discover backend tools once some user's authenticated request
+arrives — which is why catalog discovery is lazy (§6) rather than done at startup.
 
-這是整個 OBO 的核心，務必分清楚：
+## 3. Token Model
 
-```
-token1  ── VS Code 拿著呼叫 /mcp
-  iss = <sidecar>
-  sub = alice            ← 真實使用者
-  aud = <sidecar>/mcp    ← 只能用來進 sidecar
-  scope = mcp.read mcp.invoke
+### USER_TOKEN
 
-        │  token exchange (RFC 8693)
-        ▼
-token2  ── sidecar 拿著去呼叫 master（代表 alice）
-  iss = <sidecar>
-  sub = alice            ← 身份原封不動傳遞
-  aud = <master>         ← 只能用來打 master
-  act = { sub: "mcp-sidecar" }   ← actor: 誰在代表 alice 行動
-  scope = master.read (下游最小權限)
-```
-
-`act`（actor claim）是 RFC 8693 的靈魂：明確記錄「**是 sidecar 這個服務，代表 alice** 去呼叫
-master」，審計時能還原整條委派鏈，而不是偽裝成 alice 本人。
-
-Token Exchange 請求（sidecar → 自身 `/oauth2/token`）：
-
-```
-grant_type          = urn:ietf:params:oauth:grant-type:token-exchange
-subject_token       = <token1>
-subject_token_type  = urn:ietf:params:oauth:token-type:access_token
-audience            = <master 的 resource 識別碼>
-requested_token_type= urn:ietf:params:oauth:token-type:access_token
+```text
+format:    signed JWT (RS256, master's key)
+issuer:    master
+subject:   current authenticated user
+audience:  Agent Service resource
+token_use: mcp_user
+sid:       current master login session
+TTL:       15 minutes, clamped to the end of the login session
 ```
 
----
-
-## 4. 時序圖（Phase 1 完整流程）
-
-```mermaid
-sequenceDiagram
-    autonumber
-    actor User as 使用者(瀏覽器)
-    participant VSCode as MCP客戶端(VS Code)
-    participant RS as Sidecar RS(/mcp)
-    participant AS as Sidecar AS
-    participant IdP as 身份源(IdP/LDAP)
-    participant OBO as Sidecar OBO元件
-    participant Resolver as Master憑證解析器
-    participant Master as BLSS master(Basic)
-
-    Note over VSCode,AS: 階段A 探索與挑戰 (RFC 9728, 不變)
-    VSCode->>RS: POST /mcp (無 token)
-    RS-->>VSCode: 401 WWW-Authenticate + resource_metadata
-    VSCode->>RS: GET /.well-known/oauth-protected-resource
-    RS-->>VSCode: { resource, authorization_servers, scopes }
-    VSCode->>AS: GET /.well-known/oauth-authorization-server
-    AS-->>VSCode: 端點清單(含 token_endpoint 支援 token-exchange)
-
-    Note over User,AS: 階段B 授權碼+PKCE, 登入對接真實身份源
-    VSCode->>AS: GET /oauth2/authorize (PKCE, resource=<sidecar>/mcp)
-    AS-->>User: 302 轉址 /login
-    User->>AS: 輸入企業帳密
-    AS->>IdP: 驗證帳密
-    IdP-->>AS: 身份 (sub=alice, groups)
-    AS-->>VSCode: 302 loopback + authorization code
-    VSCode->>AS: POST /oauth2/token (code + code_verifier)
-    AS-->>VSCode: token1 (aud=<sidecar>/mcp, sub=alice)
-
-    Note over VSCode,RS: 階段C 帶 token1 呼叫工具
-    VSCode->>RS: POST /mcp (Bearer token1)
-    RS->>RS: 驗證 token1 (jwtDecoder)
-    RS->>OBO: 工具需呼叫 master, 交出 token1
-
-    Note over OBO,Master: 階段D OBO Token Exchange + 憑證橋接
-    OBO->>AS: POST /oauth2/token<br/>grant_type=token-exchange<br/>subject_token=token1<br/>audience=<master>
-    AS->>AS: 驗 token1 + 產生 token2<br/>(sub=alice, aud=master, act=mcp-sidecar)
-    AS-->>OBO: token2
-    OBO->>Resolver: 用 token2.sub=alice 換 master 憑證
-    Resolver-->>OBO: alice 的 per-user Basic 憑證
-    OBO->>Master: GET /rest/... Authorization: Basic <alice>
-    Master-->>OBO: JSON (套 alice 的真實 RBAC)
-    OBO-->>RS: 結果
-    RS-->>VSCode: MCP 工具結果
-```
-
-> Phase 2 只改「階段 D 尾巴」：`Resolver` 拿掉，`OBO` 直接把 `token2` 當 `Authorization: Bearer`
-> 丟給 master，master 自己驗簽 + 按 `sub` 套 RBAC。
-
----
-
-## 5. 每個步驟詳解
-
-**階段 A（1–7）探索與挑戰** — 完全沿用現狀（`ProtectedResourceMetadataController`、
-`McpAuthenticationEntryPoint`）。唯一差別：AS metadata 要宣告支援 token-exchange grant。
-
-**階段 B（8–15）真身份登入** — **本設計最大的行為改變**。
-
-- 步驟 12：`/login` 不再打內存 demo 使用者，改成把帳密送到**真實身份源**驗證。
-- 步驟 13：拿回 `sub`（穩定使用者 ID）與 `groups`（給下游 RBAC / scope 用）。
-- 步驟 15：token1 的 `sub` 現在是**真實使用者**，不再是 `mcp`。`blss_token` claim **整個移除**。
-
-**階段 C（16–18）** — RS 驗 token1 不變。差別是驗完不再從 claim 直接讀 blss_token，而是把 token1
-往下交給 OBO 元件。
-
-**階段 D（19–26）OBO 核心** —
-
-- 步驟 19–21：sidecar 把 token1 送回自己的 `/oauth2/token`，用
-  `grant_type=urn:ietf:params:oauth:grant-type:token-exchange` 換出 token2（`aud=master`、帶 `act`）。
-- 步驟 22–23：**橋接件**用 token2 的 `sub` 去解析 master 的 per-user Basic 憑證（補「master 只有 Basic」）。
-- 步驟 24：發 `Basic <alice>` 呼叫 master，master 自然套 alice 的 RBAC。
-
----
-
-## 6. 每個角色要做的工作
-
-### 身份源 IdP / LDAP（新接）
-
-- 提供帳密驗證接口，回傳穩定 `sub` 與群組。
-- 決定 `sub` 的形式（LDAP DN？email？員工號？）——**這個 ID 要能被 master 認出來對應到 master 使用者**，
-  否則橋接無從映射。
-
-### Sidecar AS（擴充）— `AuthorizationServerConfig.java`
-
-- 啟用 / 實作 token-exchange grant（Spring Authorization Server 1.3+ 有內建
-  `OAuth2TokenExchangeAuthenticationProvider`，舊版需自定義 provider）。
-- 註冊一個**機密客戶端** `mcp-sidecar`（有 secret），因為 token exchange 是後端對後端，不該用 public client。
-- token2 的 customizer：設 `aud=<master>`、注入 `act={sub:"mcp-sidecar"}`、下游最小 scope。
-- **移除** `jwtTokenCustomizer` 裡塞 `blss_token` 的那段。
-
-### Sidecar 登入（改）— `SecurityConfig.java`
-
-- 把 `InMemoryUserDetailsManager`（demo `mcp/mcp-pass`）換成對接 IdP 的 `UserDetailsService` /
-  `AuthenticationProvider`。
-
-### Sidecar OBO 元件（新建）
-
-- 一個 service：輸入 token1 → 呼叫 token-exchange → 得 token2 → 交給 Resolver → 設定 master 認證頭。
-- 取代現在 `UserTokenCaptureFilter` 從 claim 讀 token 的做法。可加短期快取（同一 token1 期間不必反覆 exchange）。
-
-### Master 憑證解析器（新建，橋接件）
-
-- 契約：`resolve(sub, act, scopes) → master Basic 憑證`。
-- 三種實作可選（見第 7 節）。
-
-### MasterClient（小改）— `MasterClient.java`
-
-- Phase 1：仍發 `Basic`，但值來自 Resolver 而非 `ThreadLocal` 裡的固定 claim。
-- Phase 2：改發 `Bearer token2`。建議把「認證頭怎麼組」抽成策略，讓 Phase 1→2 只換實作。
-
-### BLSS master（Phase 1 幾乎不動 / Phase 2 大改）
-
-- 見第 7 節三選一。
-
----
-
-## 7. 「master 只有 Basic」的橋接方案（三選一）
-
-| 方案 | master 端改動 | 安全性 | 適用 |
-|------|--------------|--------|------|
-| **B1 憑證保管庫** | **零**。sidecar 讀一個 `sub → per-user Basic` 的保管庫（vault / 加密表），由管理員預先為每個使用者建 master API 憑證 | 中（憑證要安全保存 + 輪替） | master 完全不能動時 |
-| **B2 管理員代鑄接口** ⭐ | **極小**。master 加一個 `POST /rest/tokens/impersonate?user=<sub>`，sidecar 用服務管理員身份呼叫，換回該使用者短期 per-user token | 高（短期、可撤銷、不存明文） | 推薦：改動小又乾淨 |
-| **B0 終態：master 變 OAuth2 RS** | **大**。master 拿 sidecar JWKS 驗簽、按 `sub` 建 UserContext | 最高 | Phase 2 |
-
-**推薦 Phase 1 用 B2**：master 只需加一支「代某使用者鑄短期憑證」的接口，就能讓 sidecar 拿到真正
-per-user 的 Basic，橋接乾淨且可審計。等哪天走 B0，Resolver 直接退場。
-
-### 7.1 B2 下 master 如何認證 sidecar（信任邊界核心）
-
-impersonate 接口「能為任意使用者鑄 token」，權力比任何普通使用者都大，因此「master 怎麼認 sidecar」
-直接決定整個 OBO 的安全下限。呼叫時 master 要同時確認三件事：
+**The browser mints one immediately before every chat request and does not cache it.** Master keeps
+a record per login session and returns the recorded token while more than **5 minutes** remain,
+re-signing otherwise — so a caller always receives at least 5 minutes of usable lifetime.
 
 ```
-① 認證(AuthN): 你真的是 sidecar 這個服務嗎?   → 服務身份憑證
-② 授權(AuthZ): 這服務被允許代鑄任意使用者嗎?  → 特殊權限 CAN_IMPERSONATE, 普通帳號沒有
-③ 代誰(Subject): user=<sub> 可信嗎?           → sidecar 的斷言, 其可信度 = ①的強度
+      ├──────────────────── 15 min ────────────────────┤
+      ├──────── stable: return the recorded one ──┼ 5m ┤
+      0                                               exp
+                                              ↑ re-sign from here
 ```
 
-**關鍵認知**：master 是「信任 sidecar 的斷言」——sidecar 說「幫 alice 鑄一個」，master 就照做。
-所以一旦 ① 的服務憑證外洩，攻擊者就能冒充任何人。因此 ① 要盡量強，並用縱深防禦兜底。
+Returning the same token bounds how many credentials are live: a user sending ten messages holds one
+token rather than ten. The record is keyed by **login session** and cleared on logout — keying it by
+user would hand a freshly logged-in user a token bound to the dead `sid`, leaving them without MCP
+access for up to 15 minutes.
 
-**master 認 sidecar 的機制（① 的選項）**
+It is a signed JWT rather than an opaque handle because the Agent is its audience: the Agent
+validates it locally and reads `sub`/`sid` for its cache key.
 
-| 機制 | master 要做的事 | 強度 | 說明 |
-|------|----------------|------|------|
-| **專用服務帳號 (Basic)** ⭐ 起步 | 建一個帶 `CAN_IMPERSONATE` 權限的服務帳號 | 中 | 與 master 現有 Basic 一致，最快。靜態高價值密鑰，必須進 vault + 輪替 |
-| **mTLS 雙向憑證** ⭐ 加固 | 在 master／閘道校驗客戶端憑證 | 高 | 服務身份綁到憑證，密鑰不隨請求走，防重放/竊聽 |
-| **API Key / 專用強密鑰頭** | 比對一個 header | 中 | 跟 Basic 差不多，換個形式 |
-| **HMAC 簽名請求** | 共享密鑰驗簽 + 時間戳/nonce | 中高 | 防重放，但要實作簽名邏輯 |
-| **網路隔離 / IP allowlist** | 只放行 sidecar 主機來源 | （疊加項） | 不能單獨用，疊加後大幅收斂攻擊面 |
+The Agent uses it both as its inbound credential and as the RFC 8693 `subject_token`. The token
+endpoint requires no separate Agent client authentication and validates that `sid` still identifies
+an active session before exchange.
 
-**建議組合**：`專用服務帳號(Basic) + mTLS + 網路只允許 sidecar 來源`。第一版可先做
-「服務帳號 + IP allowlist」上線，mTLS 之後補。
+> **Topology**: the browser calls the Agent **directly** (it is not proxied through Core), so
+> `<agent-resource>` is an externally reachable URL behind the same reverse proxy as the gateway.
+> The `USER_TOKEN` therefore lands in browser JavaScript. The browser already holds `APP_SESSION`,
+> which is more powerful, so the incremental exposure is not about duration but about
+> **portability** — an `HttpOnly` cookie cannot be exfiltrated by XSS, a JWT can. This is bounded by
+> the 15-minute lifetime and by `sid` binding, and accepted.
 
-**加固後的 impersonate 接口契約**
+### MCP_ACCESS_TOKEN
 
-```
-POST /rest/tokens/impersonate
-Authorization: Basic <sidecar 服務帳號>        ← ① 認證(該帳號需 CAN_IMPERSONATE 權限 ②)
-（若走 mTLS）客戶端憑證 CN = mcp-sidecar        ← ① 更強的服務身份
-Body: { "user": "alice", "ttl": "5m",          ← ③ 代誰 + 短命
-        "actor": "mcp-sidecar" }               ← 審計用: 記錄委派鏈
-
-回應: { "token": "<alice 的短期 per-user 憑證>", "expires_in": 300 }
-```
-
-**master 端必做的加固**
-
-1. **獨立特權**：服務帳號只有 `CAN_IMPERSONATE`，**不是**普通使用者、不能直接讀業務資料。
-2. **鑄出來的 token 要短命 + 可撤銷**（例：5 分鐘），把外洩窗口壓到最小。
-3. **禁止代鑄高權限使用者**：加黑名單（不能 impersonate admin / 其他服務帳號），否則等於提權後門。
-4. **全量審計**：每次「誰、代誰、何時、來源 IP」落審計日誌，配速率限制 / 異常偵測。
-5. **`user` 參數的來源**：sidecar 端這個 `sub` 必須來自**驗過的 token2**，不能是外部可控輸入。
-
-**信任鏈時序圖**
-
-```mermaid
-sequenceDiagram
-    autonumber
-    participant OBO as Sidecar OBO元件
-    participant Master as BLSS master
-    Note over OBO,Master: 前提: 網路上只有 sidecar 能連到 impersonate 接口
-    OBO->>Master: POST /rest/tokens/impersonate<br/>Basic <服務帳號> (+mTLS客戶端憑證)<br/>{ user: alice(來自token2.sub), ttl:5m }
-    Master->>Master: ① 驗服務帳號/憑證 (你是sidecar嗎)
-    Master->>Master: ② 檢查 CAN_IMPERSONATE 權限
-    Master->>Master: ③ 檢查 alice 不在禁止代鑄名單
-    Master->>Master: 記審計 + 速率限制
-    Master-->>OBO: 短期 per-user 憑證 (5分鐘)
-    OBO->>Master: GET /rest/... Basic <alice短期憑證>
-    Master-->>OBO: 資料 (套 alice RBAC)
+```text
+issuer: master Authorization Server
+subject: preserved from USER_TOKEN
+audience: the MCP Gateway resource
+TTL: approximately 30 minutes
 ```
 
-**取捨提醒**：B2 的安全性天花板 = sidecar 服務憑證的保護強度。
+There is one shared MCP audience for the Gateway and all configured backends. The Gateway does not
+exchange this token again or mint a backend-specific token.
 
-- **B2**：master 信任「sidecar 說某人是 alice」→ 信任的是**服務**。
-- **Phase 2**：master 自己驗 token2 簽章 → 信任的是**簽發者（AS）的密鑰**，sidecar 被攻破也偽造不出簽章。
+### MCP_REFRESH_TOKEN
 
-B2 是「用一個高價值服務密鑰換取 master 不用改認證」的折衷，短期合理，長期仍應往 Phase 2 收斂。
+The Agent uses the refresh token to renew the MCP access token. The Gateway does not handle refresh
+tokens. If refresh returns `invalid_grant`, the Agent repeats token exchange with the `USER_TOKEN`
+that arrived with the current request. Logout prevents future exchange **and** future refresh because
+`sid` is no longer active; an existing MCP access token is allowed to expire naturally.
 
----
+> **Retained, though currently redundant.** Because the browser supplies a fresh `USER_TOKEN` on
+> every chat request, the Agent can always renew by repeating the exchange, at the same cost as a
+> refresh (one token-endpoint call plus one session lookup). Refresh therefore buys nothing today
+> while being the longest-lived credential in the system (~8 h, portable), and retaining it obliges
+> the `sid` binding plus a session re-check on **every** refresh — without which logout would stop
+> revoking MCP access. **Revisit when** the Agent gains work that outlives the request that started
+> it (asynchronous or background tool calls), at which point no fresh `USER_TOKEN` is available and
+> refresh becomes necessary. Removing it would cap the longest-lived credential at 30 minutes.
 
-## 8. 需要做的事情清單（Tasks）
+## 4. Discovery and Token Exchange
 
-**先決 / 決策**
+```text
+Agent -> Gateway POST /mcp without token
+Gateway -> Agent 401 + WWW-Authenticate resource_metadata=<gateway metadata URI>
 
-- [ ] 確認身份源（IdP / LDAP / AD？`sub` 用什麼欄位）
-- [ ] 確認 master 對應：sidecar 的 `sub` 如何對到 master 使用者
-- [ ] 選定橋接方案 B1 / B2
+Agent -> Gateway GET /.well-known/oauth-protected-resource
+Gateway -> Agent resource=<mcp-resource>, authorization_servers=[master AS]
 
-**Sidecar — AS**
+Agent -> master AS GET /.well-known/oauth-authorization-server
+master AS -> Agent token_endpoint, jwks_uri, supported grants
+```
 
-- [ ] 啟用 / 實作 token-exchange grant
-- [ ] 註冊機密客戶端 `mcp-sidecar`
-- [ ] token2 customizer：`aud=master` + `act` + 下游 scope
-- [ ] 移除 `blss_token` claim 注入
+Concrete AS endpoints as implemented:
 
-**Sidecar — 登入**
+| Purpose | Path (relative to `issuer`) |
+|---------|-----------------------------|
+| RFC 8414 metadata | `/.well-known/oauth-authorization-server` |
+| JWK Set | `/.well-known/jwks.json` |
+| Token endpoint | `/oauth2/token` (not implemented yet) |
 
-- [ ] `UserDetailsService` 對接真實身份源，下線 demo 使用者
+> **Deployment note.** Master is a WAR served under a Tomcat context path, but the `issuer` is an
+> externally reachable host (`https://auth.blss.local`). A reverse proxy must map the issuer origin
+> onto master's context path, or discovery will not resolve. The `jwks_uri` advertised in the
+> metadata is derived from the configured issuer, so it is whatever the proxy exposes.
 
-**Sidecar — OBO / Master**
+```text
+Agent -> master AS POST /oauth2/token
+  grant_type=urn:ietf:params:oauth:grant-type:token-exchange
+  subject_token=<USER_TOKEN>
+  subject_token_type=urn:ietf:params:oauth:token-type:jwt
+  resource=<mcp-resource>
 
-- [ ] 新建 OBO 交換 service（含短期快取）
-- [ ] 新建 Master 憑證解析器（依 B1/B2 實作）
-- [ ] `MasterClient` 認證頭抽成策略（Phase 1 Basic / Phase 2 Bearer）
-- [ ] 調整 / 退役 `UserTokenCaptureFilter`
+master AS -> Agent MCP_ACCESS_TOKEN + MCP_REFRESH_TOKEN
+```
 
-**Master（待補）**
+The token endpoint uses the validated `USER_TOKEN` as its only credential and advertises
+`token_endpoint_auth_methods_supported=["none"]`. V1 does not advertise or request OAuth scopes;
+backend RBAC is authoritative.
 
-- [ ] B2：新增 `impersonate` 代鑄接口（或 B1：建 per-user 憑證保管庫）
-- [ ] Phase 2（未來）：master 變 OAuth2 resource server
+## 5. Gateway Token Validation
 
-**配置 / 清理**
+For every authenticated MCP request, the Gateway validates:
 
-- [ ] 移除 `sidecar.blss-user-token` 與相關 demo 設定
-- [ ] 新增 master resource 識別碼、OBO client secret、Resolver 設定
+- signature against master's JWKS;
+- `iss` equals the configured master issuer;
+- `aud` contains the configured MCP resource;
+- `exp` and `nbf`, with configured clock skew.
 
----
+An invalid token produces `401`. User identity comes from the signed token, never from tool
+arguments or a caller-supplied identity header.
 
-## 9. 風險與未決問題
+## 6. Lazy Tool Aggregation
 
-1. **`sub` 對映是整個設計的地基**。sidecar 的使用者 ID 若無法穩定對到 master 使用者，B1/B2 都建不起來。
-2. **雙 token 生命週期**：token2 要短命且不外洩；OBO 快取要在 token1 過期或撤銷時失效。
-3. **Spring Authorization Server 版本**：內建 token-exchange 在較新版本才有，要先確認版本。
-4. **master 代鑄接口的信任邊界**（B2）：那支接口權力很大，必須只認 sidecar 的服務身份 + 網路隔離。
+The Gateway does not contact backend MCP servers during process startup.
+
+```text
+First authenticated tools/list
+or tools/call with no catalog
+             |
+             v
+use the current validated MCP_ACCESS_TOKEN
+             |
+             +--> BLSS MCP initialize + tools/list
+             +--> Superset MCP initialize + tools/list
+             |
+             v
+atomically publish catalog + routing table
+```
+
+The Gateway's own `initialize` response is fixed and advertises only `tools`; it does not trigger
+backend discovery. Metadata, unauthenticated requests, and unsupported non-tools requests also do
+not trigger discovery.
+
+### Global catalog contract
+
+Backend `tools/list` definitions are identity-independent. Every valid user sees the same tool names
+and schemas for a given backend version. User-specific authorization occurs only during
+`tools/call`. This permits one global catalog rather than a cache keyed by user.
+
+### Namespacing and routing
+
+```text
+BLSS MCP tool query_asset       -> blss__query_asset
+Superset MCP tool run_sql       -> superset__run_sql
+```
+
+The double underscore is the routing separator. On `tools/call`, the Gateway resolves the prefix,
+removes it, forwards the original arguments and same access token, and returns the backend result
+without semantic transformation.
+
+### Invalid tool definitions are skipped, not fatal
+
+An individual tool definition that is unusable — a name outside `[a-zA-Z0-9_-]+`, or a missing or
+non-object `inputSchema` — is **dropped**, and the backend's remaining valid tools are still
+published. One malformed tool must not remove an entire backend's namespace from the catalog.
+
+A backend's discovery fails **as a unit** only when its `tools/list` response is structurally
+unusable (no readable `tools` array).
+
+The trade-off is that a skipped tool is **silently absent** rather than loudly failing: the Gateway
+logs it, but the Agent sees only a tool that is not there, and calling it yields `unknown_tool`. Each
+backend is therefore required to validate its own catalog — see the BLSS MCP backend contract.
+
+### Request-driven refresh
+
+The freshness TTL defaults to 10 minutes. Once stale, the next
+authenticated `tools/list` or `tools/call` refreshes the catalog with that request's token. The
+Gateway never stores an end-user token for a later refresh. Concurrent initialization or refresh
+requests share one in-flight operation, and catalog/routes are published as one immutable snapshot.
+
+## 7. Failure Semantics
+
+| Situation | Behavior |
+|-----------|----------|
+| One or more backends succeed during initial discovery | Publish a partial catalog |
+| Every backend fails during initial discovery | Return `catalog_unavailable`; retry no earlier than the 30-second failure backoff |
+| Backend fails during a later refresh | Keep that backend's last-known-good tools and routes |
+| Every backend fails during a later refresh | Successfully serve the existing snapshot and retry after the 30-second backoff |
+| Tool targets a currently unavailable backend | Fail only that call |
+| Another backend remains available | Continue serving and routing its tools |
+
+Last-known-good entries can remain visible while their backend is temporarily unavailable. Agents
+must therefore handle a per-call unavailable error even for a tool returned by `tools/list`.
+
+### Stable error categories
+
+Every Gateway-originated tool-call failure carries one of these categories in the JSON-RPC
+`error.data.category`. The category and its safe message are part of the contract; the numeric code
+may follow the transport convention. No message ever contains a token or an internal backend URL.
+
+| Category | Meaning | Evaluated |
+|----------|---------|-----------|
+| `unknown_prefix` | The tool name's prefix matches no configured backend | **Before** any discovery |
+| `catalog_unavailable` | No catalog exists because every backend failed initial discovery | After prefix check |
+| `backend_unavailable` | The prefix names a configured backend whose catalog could not be discovered, or the call to it failed | After catalog resolution |
+| `invalid_backend_catalog` | That backend's `tools/list` response was structurally unusable | After catalog resolution |
+| `unknown_tool` | The backend was discovered but does not expose the de-prefixed tool — including a tool that was skipped as invalid | Last |
+
+A JSON-RPC error returned by the **backend** (for example a business authorization failure) is
+relayed to the Agent unchanged and does not carry a Gateway category.
+
+## 8. OBO Pass-through and Trust Boundary
+
+```text
+Agent
+  Authorization: Bearer MCP_ACCESS_TOKEN
+       |
+       v
+Gateway validates signature/iss/aud/time
+       |
+       | same token, unchanged
+       v
+BLSS MCP or Superset MCP
+  independently validates signature/iss/aud/time
+  reads sub
+  applies backend RBAC
+```
+
+Internal networking or loopback is not an authentication boundary. Each backend must independently
+validate the signed token before trusting `sub`. The Gateway uses no static/shared credential and
+must mask tokens in all logs.
+
+## 9. Capability Boundary
+
+Gateway v1 aggregates only MCP tools:
+
+- supported: `initialize`, `tools/list`, `tools/call`;
+- not aggregated or routed: `resources`, `prompts`, `logging`, `completions`.
+
+Any future non-tools aggregation requires a separate design because those capabilities need their
+own namespace, routing, lifecycle, and failure semantics.
+
+## 10. Deployment Identifiers
+
+Three identifiers must agree across master, the gateway and the Agent. Only `issuer` has to
+resolve — the Agent fetches `jwks_uri`, which is derived from it. `<mcp-resource>` and
+`<agent-resource>` are opaque audience identifiers, compared as strings and never dereferenced; they
+are URLs only because RFC 8707 requires an absolute URI.
+
+| Identifier | Meaning | Consumed by |
+|---|---|---|
+| `issuer` | Who signs the tokens; base of the discovery documents | Gateway (`iss` check, JWKS), Agent (metadata) |
+| `<mcp-resource>` | The gateway's canonical MCP URI; the `aud` of `MCP_ACCESS_TOKEN` | Gateway and every backend (`aud` check), Agent (`resource` parameter) |
+| `<agent-resource>` | The Agent Service; the `aud` of `USER_TOKEN` | Master's token endpoint, Agent |
+
+### Production shape
+
+master and the gateway sit behind the **same existing reverse proxy**, on one external origin, split
+by path. This keeps an on-premise install to a single hostname:
+
+```text
+https://blss.<deployment>/mcp                                    -> gateway
+https://blss.<deployment>/.well-known/oauth-protected-resource   -> gateway
+https://blss.<deployment>/.well-known/oauth-authorization-server -> master
+https://blss.<deployment>/.well-known/jwks.json                  -> master
+everything else (/rest/** ...)                                   -> master
+```
+
+> The two `/.well-known` documents belong to **different services**. Routing both to master (the
+> obvious mistake, since master owns the origin) makes the gateway's protected-resource metadata
+> unreachable, and the failure presents as a blanket `401` with no other diagnostic.
+
+Then:
+
+```text
+issuer            = https://blss.<deployment>
+<mcp-resource>    = https://blss.<deployment>/mcp
+<agent-resource>  = https://blss.<deployment>/agent
+```
+
+`<mcp-resource>` carrying the `/mcp` path is correct: the MCP specification defines the resource
+identifier as the canonical URI of the MCP server and lists `https://mcp.example.com/mcp` as a valid
+example, instructing clients to use the most specific URI they can.
+
+The gateway's own listen port is internal; the reverse proxy is the public surface, so the port is
+not part of any identifier.
+
+### Placeholders in code
+
+Compiled-in defaults use the reserved host `blss.invalid` (RFC 2606 guarantees `.invalid` never
+resolves) rather than a production-shaped value. A deployment that forgets to configure these fails
+visibly instead of minting tokens against a plausible but wrong identity; master also logs a warning
+while the placeholder is still in use. Substituting the real domain is a single replacement, because
+all three identifiers share the placeholder host.
+
+## 11. Open Items
+
+- The deployment domain itself, and the reverse-proxy rules above.
+- **How master re-checks that a login session is still active** during exchange and refresh. This is
+  the foundation of "one token per user + logout revokes", and it has not been investigated. The OTT
+  handoff store cannot be reused (one-per-user, consumed on use, bridges to a full login session).
+- Master's signing key is generated in memory at startup and is not persisted, so a restart
+  invalidates every outstanding token. Accepted for a single node; must change if master is clustered.
+- Superset MCP authentication and user mapping; integration is deferred until BLSS MCP is complete.
+- Audit storage, retention, and sink details, tracked by the separate `gateway-audit` change.
+
+> Protocol-revision items (`2026-07-28` support, `subscriptions/listen`, `x-mcp-header`) are tracked
+> by the `gateway-mcp-2026-07-28` change, not here.

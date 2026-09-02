@@ -7,127 +7,105 @@ import java.util.List;
 import org.springframework.boot.context.properties.ConfigurationProperties;
 
 /**
- * Configuration for the sidecar.
+ * Configuration for the sidecar, now a pure MCP Gateway / Resource Server.
  *
- * <p>Two auth legs (see doc/mcp appendix B):
+ * <p>Auth model (On-Behalf-Of):
  * <ul>
- *   <li>Leg A — Nexus -> sidecar service trust: static API key ({@code apiKey}).</li>
- *   <li>Leg B — sidecar -> master: the end-user delegation token is passed through
- *       from the inbound MCP request header ({@code userTokenHeader}) to master REST.</li>
+ *   <li>The {@code /mcp} Resource Server validates {@code MCP_ACCESS_TOKEN}s issued by an
+ *       EXTERNAL Authorization Server (master), verifying the signature against the AS
+ *       {@code jwks_uri} plus {@code iss}/{@code aud}/{@code exp}.</li>
+ *   <li>Leg B (OBO) — the validated access token is forwarded unchanged to the routed backend MCP
+ *       server as a {@code Bearer} JWT so that backend rebuilds the real user's context from
+ *       {@code sub} and applies its own RBAC.</li>
  * </ul>
  */
 @ConfigurationProperties(prefix = "sidecar")
 public class SidecarProperties {
 
-    /** Base URL of BLSS master REST API, e.g. https://master.example.com/bldc-blss-master. */
-    @NotBlank
-    private String masterBaseUrl;
-
-    /** Shared secret that Nexus must present (Leg A). Compared against the X-API-Key header. */
-    @NotBlank
-    private String apiKey;
-
-    /** Header carrying the Leg A service API key. */
-    private String apiKeyHeader = "X-API-Key";
-
-    /** Inbound header carrying the end-user delegation token (Leg B, on-behalf-of). */
-    private String userTokenHeader = "X-BLSS-User-Token";
-
-    /** Outbound header the sidecar sets when forwarding the delegation token to master REST. */
-    private String masterAuthHeader = "Authorization";
-
     /**
-     * Leg B (on-behalf-of) — fixed BLSS delegation token (Base64 of {@code user:password}) embedded
-     * into the issued access-token JWT as the {@code blss_token} claim, then forwarded by
-     * {@code MasterClient} to master REST as {@code Basic} auth. POC only: later this can be replaced
-     * by a per-user value derived at login without touching MasterClient.
-     */
-    private String blssUserToken = "";
-
-    /**
-     * Leg A (OAuth 2.1) — the public base URL of this sidecar, used as the OAuth issuer and to
-     * build the {@code resource} / {@code authorization_servers} values in the protected-resource
-     * metadata. Must match the URL the MCP client uses to reach the sidecar.
+     * External Authorization Server (master) issuer URL. Used to discover the {@code jwks_uri}
+     * (when {@code jwksUri} is blank), to validate the {@code iss} claim of incoming access tokens,
+     * and to advertise {@code authorization_servers} in the protected-resource metadata.
      */
     @NotBlank
     private String issuerUri = "http://localhost:8090";
 
-    /** Leg A (OAuth 2.1) — demo resource-owner username for the interactive login (POC only). */
+    /**
+     * Optional explicit JWKS endpoint of the external Authorization Server. When blank, the decoder
+     * discovers it from {@code issuerUri} via OIDC/RFC 8414 metadata.
+     */
+    private String jwksUri = "";
+
+    /**
+     * The MCP resource identifier (RFC 8707) this gateway represents. Incoming access tokens MUST
+     * carry it in {@code aud}; also published as {@code resource} in the protected-resource metadata
+     * and used to build the resource-metadata pointer URL. Must be a URL served by this sidecar.
+     */
     @NotBlank
-    private String authUsername = "mcp";
+    private String mcpResource = "http://localhost:8090/mcp";
 
-    /** Leg A (OAuth 2.1) — demo resource-owner password for the interactive login (POC only). */
-    @NotBlank
-    private String authPassword = "mcp-pass";
-
-    /**
-     * Leg A (OAuth 2.1) — public (PKCE, no-secret) client_ids to pre-seed into the registered-client
-     * store on startup. Use this to recover a client_id that an MCP client (e.g. VS Code) cached from
-     * an earlier in-memory registration that was lost on restart, since such clients do not
-     * re-register on their own. Each is created with the MCP scopes and the standard loopback
-     * redirect URIs. Safe to leave empty once clients register dynamically against the persistent store.
-     */
-    private List<String> seedPublicClientIds = new ArrayList<>();
+    /** Allowed clock skew when validating {@code exp}/{@code nbf} on incoming access tokens. */
+    private Duration clockSkew = Duration.ofSeconds(60);
 
     /**
-     * Connect timeout for outbound calls to master REST. Bounds how long {@code MasterClient} waits
-     * to establish a TCP connection before failing fast, so a hung/slow master cannot stall a tool
-     * call indefinitely (which otherwise races with the MCP client tearing down the session).
+     * Static registry of backend MCP servers this gateway aggregates (D13). Validated at startup by
+     * {@code BackendRegistry}: prefixes are required, unique (case-sensitive), match
+     * {@code [a-zA-Z0-9_-]+} and must not contain {@code __}; URLs must be absolute. An entry whose
+     * backend is unreachable does NOT fail startup, because discovery is lazy (D10).
      */
-    private Duration masterConnectTimeout = Duration.ofSeconds(5);
+    private List<Backend> backends = new ArrayList<>();
 
     /**
-     * Read (response) timeout for outbound calls to master REST. Bounds how long {@code MasterClient}
-     * waits for the master response before failing fast.
+     * Freshness threshold for the aggregated tool catalog (D10). This is a request-driven threshold,
+     * not a background schedule: once it has elapsed, the next authenticated {@code tools/list} or
+     * {@code tools/call} refreshes the catalog with that request's token.
      */
-    private Duration masterReadTimeout = Duration.ofSeconds(15);
+    private Duration catalogTtl = Duration.ofMinutes(10);
 
-    public String getMasterBaseUrl() {
-        return masterBaseUrl;
-    }
+    /**
+     * Minimum delay before another discovery/refresh is attempted after a failed one (D11). During
+     * the backoff window a stale or partial catalog is served instead of retrying the backends.
+     */
+    private Duration catalogFailureBackoff = Duration.ofSeconds(30);
 
-    public void setMasterBaseUrl(String masterBaseUrl) {
-        this.masterBaseUrl = masterBaseUrl;
-    }
+    /** Connect timeout for outbound MCP calls to backend servers, so a hung backend fails fast. */
+    private Duration backendConnectTimeout = Duration.ofSeconds(5);
 
-    public String getApiKey() {
-        return apiKey;
-    }
+    /** Read (response) timeout for outbound MCP calls to backend servers. */
+    private Duration backendReadTimeout = Duration.ofSeconds(15);
 
-    public void setApiKey(String apiKey) {
-        this.apiKey = apiKey;
-    }
+    /** A single backend MCP server entry in the static registry. */
+    public static class Backend {
 
-    public String getApiKeyHeader() {
-        return apiKeyHeader;
-    }
+        /** External namespace prefix, joined to the native tool name with {@code __}. */
+        private String prefix;
 
-    public void setApiKeyHeader(String apiKeyHeader) {
-        this.apiKeyHeader = apiKeyHeader;
-    }
+        /** Absolute base URL of the backend's Streamable HTTP MCP endpoint. */
+        private String url;
 
-    public String getUserTokenHeader() {
-        return userTokenHeader;
-    }
+        public Backend() {
+        }
 
-    public void setUserTokenHeader(String userTokenHeader) {
-        this.userTokenHeader = userTokenHeader;
-    }
+        public Backend(String prefix, String url) {
+            this.prefix = prefix;
+            this.url = url;
+        }
 
-    public String getMasterAuthHeader() {
-        return masterAuthHeader;
-    }
+        public String getPrefix() {
+            return prefix;
+        }
 
-    public void setMasterAuthHeader(String masterAuthHeader) {
-        this.masterAuthHeader = masterAuthHeader;
-    }
+        public void setPrefix(String prefix) {
+            this.prefix = prefix;
+        }
 
-    public String getBlssUserToken() {
-        return blssUserToken;
-    }
+        public String getUrl() {
+            return url;
+        }
 
-    public void setBlssUserToken(String blssUserToken) {
-        this.blssUserToken = blssUserToken;
+        public void setUrl(String url) {
+            this.url = url;
+        }
     }
 
     public String getIssuerUri() {
@@ -138,43 +116,67 @@ public class SidecarProperties {
         this.issuerUri = issuerUri;
     }
 
-    public String getAuthUsername() {
-        return authUsername;
+    public String getJwksUri() {
+        return jwksUri;
     }
 
-    public void setAuthUsername(String authUsername) {
-        this.authUsername = authUsername;
+    public void setJwksUri(String jwksUri) {
+        this.jwksUri = jwksUri;
     }
 
-    public String getAuthPassword() {
-        return authPassword;
+    public String getMcpResource() {
+        return mcpResource;
     }
 
-    public void setAuthPassword(String authPassword) {
-        this.authPassword = authPassword;
+    public void setMcpResource(String mcpResource) {
+        this.mcpResource = mcpResource;
     }
 
-    public List<String> getSeedPublicClientIds() {
-        return seedPublicClientIds;
+    public Duration getClockSkew() {
+        return clockSkew;
     }
 
-    public void setSeedPublicClientIds(List<String> seedPublicClientIds) {
-        this.seedPublicClientIds = seedPublicClientIds;
+    public void setClockSkew(Duration clockSkew) {
+        this.clockSkew = clockSkew;
     }
 
-    public Duration getMasterConnectTimeout() {
-        return masterConnectTimeout;
+    public List<Backend> getBackends() {
+        return backends;
     }
 
-    public void setMasterConnectTimeout(Duration masterConnectTimeout) {
-        this.masterConnectTimeout = masterConnectTimeout;
+    public void setBackends(List<Backend> backends) {
+        this.backends = backends;
     }
 
-    public Duration getMasterReadTimeout() {
-        return masterReadTimeout;
+    public Duration getCatalogTtl() {
+        return catalogTtl;
     }
 
-    public void setMasterReadTimeout(Duration masterReadTimeout) {
-        this.masterReadTimeout = masterReadTimeout;
+    public void setCatalogTtl(Duration catalogTtl) {
+        this.catalogTtl = catalogTtl;
+    }
+
+    public Duration getCatalogFailureBackoff() {
+        return catalogFailureBackoff;
+    }
+
+    public void setCatalogFailureBackoff(Duration catalogFailureBackoff) {
+        this.catalogFailureBackoff = catalogFailureBackoff;
+    }
+
+    public Duration getBackendConnectTimeout() {
+        return backendConnectTimeout;
+    }
+
+    public void setBackendConnectTimeout(Duration backendConnectTimeout) {
+        this.backendConnectTimeout = backendConnectTimeout;
+    }
+
+    public Duration getBackendReadTimeout() {
+        return backendReadTimeout;
+    }
+
+    public void setBackendReadTimeout(Duration backendReadTimeout) {
+        this.backendReadTimeout = backendReadTimeout;
     }
 }

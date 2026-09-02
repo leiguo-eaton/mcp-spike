@@ -9,7 +9,7 @@
     <version>0.1.0-SNAPSHOT</version>
     <packaging>jar</packaging>
     <name>nexus-mcp-sidecar</name>
-    <description>POC MCP Server sidecar for BLSS master (Option B) — wraps master REST APIs as MCP tools</description>
+    <description>MCP Gateway / Resource Server for BLSS — validates master-issued MCP access tokens and aggregates backend MCP servers On-Behalf-Of the end user</description>
 
     <parent>
         <groupId>org.springframework.boot</groupId>
@@ -20,29 +20,11 @@
 
     <properties>
         <java.version>21</java.version>
-        <spring-ai.version>2.0.0</spring-ai.version>
     </properties>
 
-    <dependencyManagement>
-        <dependencies>
-            <dependency>
-                <groupId>org.springframework.ai</groupId>
-                <artifactId>spring-ai-bom</artifactId>
-                <version>${spring-ai.version}</version>
-                <type>pom</type>
-                <scope>import</scope>
-            </dependency>
-        </dependencies>
-    </dependencyManagement>
-
     <dependencies>
-        <!-- MCP Server over HTTP (WebMVC); streamable HTTP transport selected via properties -->
-        <dependency>
-            <groupId>org.springframework.ai</groupId>
-            <artifactId>spring-ai-starter-mcp-server-webmvc</artifactId>
-        </dependency>
-
-        <!-- Web + Security -->
+        <!-- Web + Security. The MCP gateway serves its own stateless Streamable HTTP /mcp endpoint
+             and acts as an MCP client to the backend servers, so no MCP server framework is used. -->
         <dependency>
             <groupId>org.springframework.boot</groupId>
             <artifactId>spring-boot-starter-web</artifactId>
@@ -52,13 +34,9 @@
             <artifactId>spring-boot-starter-security</artifactId>
         </dependency>
 
-        <!-- Leg A (OAuth 2.1): sidecar is BOTH the Authorization Server and the Resource Server.
-             VS Code / Nexus MCP client authenticates via OAuth 2.1 (authorization code + PKCE,
-             dynamic client registration) instead of a static API key. -->
-        <dependency>
-            <groupId>org.springframework.security</groupId>
-            <artifactId>spring-security-oauth2-authorization-server</artifactId>
-        </dependency>
+        <!-- OAuth 2.1 Resource Server: validates MCP_ACCESS_TOKENs issued by an EXTERNAL
+             Authorization Server (master). The sidecar is a pure MCP Gateway / Resource Server and
+             no longer runs an Authorization Server itself. -->
         <dependency>
             <groupId>org.springframework.boot</groupId>
             <artifactId>spring-boot-starter-oauth2-resource-server</artifactId>
@@ -68,21 +46,6 @@
         <dependency>
             <groupId>org.springframework.boot</groupId>
             <artifactId>spring-boot-starter-validation</artifactId>
-        </dependency>
-
-        <!-- Persistence for the Authorization Server: dynamically-registered clients, issued
-             authorizations and consents are stored in a file-backed H2 database so they survive
-             sidecar restarts. Without this, in-memory DCR clients are wiped on every restart and
-             MCP clients (VS Code) loop forever re-authenticating against a client_id the server
-             no longer recognises. -->
-        <dependency>
-            <groupId>org.springframework.boot</groupId>
-            <artifactId>spring-boot-starter-jdbc</artifactId>
-        </dependency>
-        <dependency>
-            <groupId>com.h2database</groupId>
-            <artifactId>h2</artifactId>
-            <scope>runtime</scope>
         </dependency>
 
         <!-- Spring Framework 7 removed spring-jcl; spring-core now pulls commons-logging, which
