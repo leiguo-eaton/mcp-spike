@@ -33,15 +33,22 @@ sidecar:
   # External Authorization Server (master) issuer. Used to discover the jwks_uri (when jwks-uri is
   # blank), to validate the `iss` claim of incoming MCP_ACCESS_TOKENs, and to advertise
   # `authorization_servers` in the protected-resource metadata.
-  issuer-uri: ${SIDECAR_ISSUER_URI:http://localhost:8080}
+  issuer-uri: ${SIDECAR_ISSUER_URI:https://vdchost-server}
   # Optional explicit JWKS endpoint of the external AS. Blank = discover from issuer-uri metadata.
   jwks-uri: ${SIDECAR_JWKS_URI:}
   # The MCP resource identifier (RFC 8707) this gateway represents. Incoming tokens MUST carry it in
   # `aud`; also published as `resource` in the protected-resource metadata. Per the MCP spec this is
   # the canonical URI of the MCP server, so carrying the /mcp path is correct and preferred.
-  mcp-resource: ${SIDECAR_MCP_RESOURCE:http://localhost:8090/mcp}
+  mcp-resource: ${SIDECAR_MCP_RESOURCE:https://vdchost-server/mcp}
   # Allowed clock skew when validating exp/nbf on incoming access tokens.
   clock-skew: ${SIDECAR_CLOCK_SKEW:60s}
+
+  # DEV/INTEGRATION ONLY. Skip TLS certificate + hostname verification on outbound calls to master
+  # (JWKS/metadata discovery and On-Behalf-Of backend calls), so a self-signed master cert is
+  # accepted without a truststore. Defaulted to true for the current E2E bring-up against master's
+  # self-signed cert. MUST be set back to false for production; the dedicated mTLS work will replace
+  # this with certificate pinning and lifecycle management.
+  insecure-skip-tls-verify: ${SIDECAR_INSECURE_SKIP_TLS_VERIFY:true}
 
   # Static registry of backend MCP servers (D13). BLSS MCP is the first and only MVP backend;
   # Superset is deferred until its authentication and user-mapping contract is confirmed.
@@ -49,7 +56,7 @@ sidecar:
   # Invalid entries fail startup; an unreachable backend does not, because discovery is lazy.
   backends:
     - prefix: blss
-      url: ${BLSS_MCP_URL:http://localhost:8091/mcp}
+      url: ${BLSS_MCP_URL:https://vdchost-server/mcp}
 
   # Catalog freshness threshold (request-driven, not a background schedule) and the delay before a
   # failed discovery/refresh is retried.

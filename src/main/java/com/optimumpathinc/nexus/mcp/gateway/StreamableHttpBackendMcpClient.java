@@ -3,6 +3,7 @@ package com.optimumpathinc.nexus.mcp.gateway;
 import tools.jackson.databind.JsonNode;
 import tools.jackson.databind.ObjectMapper;
 import tools.jackson.databind.node.ObjectNode;
+import com.optimumpathinc.nexus.mcp.config.InsecureTls;
 import com.optimumpathinc.nexus.mcp.config.SidecarProperties;
 import java.util.ArrayList;
 import java.util.List;
@@ -14,6 +15,7 @@ import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.http.HttpHeaders;
 import org.springframework.http.MediaType;
 import org.springframework.http.ResponseEntity;
+import org.springframework.http.client.ClientHttpRequestFactory;
 import org.springframework.http.client.SimpleClientHttpRequestFactory;
 import org.springframework.stereotype.Component;
 import org.springframework.web.client.RestClient;
@@ -59,9 +61,17 @@ public class StreamableHttpBackendMcpClient implements BackendMcpClient {
     }
 
     private static RestClient buildRestClient(SidecarProperties props) {
-        SimpleClientHttpRequestFactory factory = new SimpleClientHttpRequestFactory();
-        factory.setConnectTimeout(props.getBackendConnectTimeout());
-        factory.setReadTimeout(props.getBackendReadTimeout());
+        ClientHttpRequestFactory factory;
+        if (props.isInsecureSkipTlsVerify()) {
+            // DEV/INTEGRATION ONLY: trust any master certificate (self-signed E2E). See InsecureTls.
+            factory = InsecureTls.requestFactory(
+                    props.getBackendConnectTimeout(), props.getBackendReadTimeout());
+        } else {
+            SimpleClientHttpRequestFactory simple = new SimpleClientHttpRequestFactory();
+            simple.setConnectTimeout(props.getBackendConnectTimeout());
+            simple.setReadTimeout(props.getBackendReadTimeout());
+            factory = simple;
+        }
         return RestClient.builder().requestFactory(factory).build();
     }
 

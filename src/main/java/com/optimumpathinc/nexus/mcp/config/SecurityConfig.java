@@ -2,6 +2,8 @@ package com.optimumpathinc.nexus.mcp.config;
 
 import com.optimumpathinc.nexus.mcp.security.AudienceValidator;
 import com.optimumpathinc.nexus.mcp.security.McpAuthenticationEntryPoint;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
 import org.springframework.context.annotation.Bean;
 import org.springframework.context.annotation.Configuration;
 import org.springframework.security.config.annotation.web.builders.HttpSecurity;
@@ -15,6 +17,7 @@ import org.springframework.security.oauth2.jwt.JwtTimestampValidator;
 import org.springframework.security.oauth2.jwt.JwtValidators;
 import org.springframework.security.oauth2.jwt.NimbusJwtDecoder;
 import org.springframework.security.web.SecurityFilterChain;
+import org.springframework.web.client.RestTemplate;
 
 /**
  * Pure MCP Gateway / Resource Server configuration.
@@ -26,6 +29,8 @@ import org.springframework.security.web.SecurityFilterChain;
  */
 @Configuration
 public class SecurityConfig {
+
+    private static final Logger LOG = LoggerFactory.getLogger(SecurityConfig.class);
 
     /**
      * Single resource-server chain. Validates the external Bearer JWT and permits the
@@ -68,10 +73,29 @@ public class SecurityConfig {
      */
     @Bean
     JwtDecoder jwtDecoder(SidecarProperties props) {
+        boolean insecure = props.isInsecureSkipTlsVerify();
+        if (insecure) {
+            LOG.warn("sidecar.insecure-skip-tls-verify=true: TLS certificate and hostname "
+                    + "verification are DISABLED for JWKS discovery and backend calls. "
+                    + "Use only for integration bring-up against a self-signed master; never in production.");
+        }
+        RestTemplate insecureRest = insecure
+                ? new RestTemplate(InsecureTls.requestFactory(
+                        props.getBackendConnectTimeout(), props.getBackendReadTimeout()))
+                : null;
+
         NimbusJwtDecoder decoder;
         String jwksUri = props.getJwksUri();
         if (jwksUri != null && !jwksUri.isBlank()) {
-            decoder = NimbusJwtDecoder.withJwkSetUri(jwksUri).build();
+            NimbusJwtDecoder.JwkSetUriJwtDecoderBuilder builder = NimbusJwtDecoder.withJwkSetUri(jwksUri);
+            if (insecure) {
+                builder.restOperations(insecureRest);
+            }
+            decoder = builder.build();
+        } else if (insecure) {
+            decoder = NimbusJwtDecoder.withIssuerLocation(props.getIssuerUri())
+                    .restOperations(insecureRest)
+                    .build();
         } else {
             decoder = (NimbusJwtDecoder) JwtDecoders.fromIssuerLocation(props.getIssuerUri());
         }

@@ -74,6 +74,15 @@ public class SidecarProperties {
     /** Read (response) timeout for outbound MCP calls to backend servers. */
     private Duration backendReadTimeout = Duration.ofSeconds(15);
 
+    /**
+     * DEV/INTEGRATION ONLY. When {@code true}, outbound TLS to master (the JWKS/metadata fetch and
+     * the On-Behalf-Of backend calls) skips certificate and hostname verification, so a self-signed
+     * master certificate is accepted without a truststore. Defaults to {@code false} and MUST stay
+     * {@code false} in production; the dedicated mTLS work will replace this with real certificate
+     * pinning and lifecycle management.
+     */
+    private boolean insecureSkipTlsVerify = false;
+
     /** A single backend MCP server entry in the static registry. */
     public static class Backend {
 
@@ -178,5 +187,13 @@ public class SidecarProperties {
 
     public void setBackendReadTimeout(Duration backendReadTimeout) {
         this.backendReadTimeout = backendReadTimeout;
+    }
+
+    public boolean isInsecureSkipTlsVerify() {
+        return insecureSkipTlsVerify;
+    }
+
+    public void setInsecureSkipTlsVerify(boolean insecureSkipTlsVerify) {
+        this.insecureSkipTlsVerify = insecureSkipTlsVerify;
     }
 }
